@@ -1,0 +1,51 @@
+FROM node:22-slim AS imagery-build
+WORKDIR /src/services/viewer/imagery
+COPY services/viewer/imagery/package*.json ./
+RUN npm ci --ignore-scripts
+COPY services/viewer/imagery/ ./
+RUN npm run build
+
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+WORKDIR /app
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY services/viewer/requirements.txt /app/requirements.txt
+COPY --from=ghcr.io/astral-sh/uv:0.10.12 /uv /usr/local/bin/uv
+RUN uv venv /app/.venv && uv pip install --python /app/.venv/bin/python -r /app/requirements.txt
+ENV PATH="/app/.venv/bin:$PATH"
+
+# Vendor MapLibre GL JS at build time; no CDN references at runtime.
+RUN mkdir -p /app/static \
+ && curl -fsSL https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js -o /app/static/maplibre-gl.js \
+ && curl -fsSL https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css -o /app/static/maplibre-gl.css
+
+# Vendor Origo (OpenLayers-based municipal map framework). Origo publishes no npm
+# package or release assets — the committed build/ directory at each git tag IS the
+# distribution (js/origo.min.js, css/style.css, css/svg/* icon sprites fetched at
+# runtime, img/*). Everything is served from /static/origo/, no CDN at runtime.
+ARG ORIGO_VERSION=2.10.0
+RUN mkdir -p /app/static/origo \
+ && curl -fsSL "https://github.com/origo-map/origo/archive/refs/tags/v${ORIGO_VERSION}.tar.gz" \
+  | tar -xz --strip-components=2 -C /app/static/origo "origo-${ORIGO_VERSION}/build" \
+ && rm -rf /app/static/origo/examples /app/static/origo/data \
+           /app/static/origo/index.html /app/static/origo/index.json
+
+COPY services/viewer/*.py /app/
+COPY services/viewer/static/ /app/static/
+COPY --from=imagery-build /src/services/viewer/static/imagery-build/ /app/static/imagery-build/
+
+COPY geodata_common /app/geodata_common
+
+EXPOSE 8001
+# Multiple workers: style.json does a DB read + embeds the layer's GeoJSON, which
+# briefly blocks its worker; a single worker 503s the concurrent asset/style
+# requests a cold page load fires, leaving the map blank until reload. The
+# viewer is stateless per request, so workers scale safely.
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001", "--workers", "3"]

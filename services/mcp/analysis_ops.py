@@ -1,0 +1,389 @@
+"""Implementation of the analyze tool: a registry of long-running analysis
+processors (list / describe / run / status / cancel).
+
+The tool declaration stays constant-size no matter how many processors exist:
+each processor is a REGISTRY entry carrying its title, one-line summary, full
+prose guidance and a JSON Schema for its params. Agents discover with
+op='list', pull the schema with op='describe' (paying its context cost only
+when about to use it), start with op='run' and follow the job with
+op='status'. Schema, guidance and validator for a processor live side by side
+in this module so they cannot drift apart (the docstring-vs-code drift that
+bit the old load(op='change_detect') English-only concepts note).
+
+Processors return workspace-scoped findings or layers. Spatial layers can be
+read with query, styled with layer and shown with map; document findings carry
+page/source references. Jobs ride the same app.jobs queue as ingest/harvest.
+"""
+
+from psycopg import sql as pgsql
+
+import db
+import job_ops
+import imagery_ops
+import inspection_ops
+import sessions
+import sqlguard
+
+# ── shared: area argument resolution ─────────────────────────────────────────
+
+CHANGE_AREA_CAP_KM2 = 2.0
+_AREA_FORMS = ("a layer ref like 'ref.byggnader' or '<ws schema>.sites', "
+               "'xmin,ymin,xmax,ymax' in EPSG:3014, or WKT in EPSG:3014")
+
+
+def _resolve_area_wkt(conn, area: str) -> tuple[str | None, str | None]:
+    """Resolve the area argument to EPSG:3014 WKT. Returns (wkt, error).
+
+    On the WKT-parse failure path the connection's transaction is aborted — callers
+    must return the error without issuing further statements on this connection.
+    """
+    m = sqlguard.LAYER_REF_RE.match(area)
+    if m:
+        schema, table = m.group(1), m.group(2)
+        exists = conn.execute("SELECT to_regclass(%s)", (area,)).fetchone()
+        if exists is None or exists[0] is None:
+            return None, f"table {area!r} does not exist — check layer(op='list')"
+        geom_col = conn.execute(
+            """SELECT column_name FROM information_schema.columns
+                WHERE table_schema = %s AND table_name = %s AND udt_name = 'geometry'
+                ORDER BY ordinal_position LIMIT 1""",
+            (schema, table),
+        ).fetchone()
+        if not geom_col:
+            return None, f"table {area!r} has no geometry column"
+        row = conn.execute(
+            pgsql.SQL("SELECT ST_AsText(ST_Envelope(ST_Extent({}))) FROM {}").format(
+                pgsql.Identifier(geom_col[0]),
+                sqlguard.qualified(schema, table))
+        ).fetchone()
+        if row is None or row[0] is None:
+            return None, f"table {area!r} is empty — no extent to analyze"
+        return row[0], None
+    parts = [p.strip() for p in area.split(",")]
+    if len(parts) == 4:
+        try:
+            nums = [float(p) for p in parts]
+        except ValueError:
+            nums = None
+        if nums is not None:
+            row = conn.execute(
+                "SELECT ST_AsText(ST_MakeEnvelope(%s, %s, %s, %s, 3014))", nums
+            ).fetchone()
+            return row[0], None
+    try:
+        row = conn.execute("SELECT ST_AsText(ST_GeomFromText(%s, 3014))", (area,)).fetchone()
+        return row[0], None
+    except Exception:
+        return None, f"could not parse area {area!r} — pass {_AREA_FORMS}"
+
+
+# ── processor: change_detect ─────────────────────────────────────────────────
+
+def _run_change_detect(workspace_id: str, area: str | None, concepts: list | None,
+                       collection_a: str | None, collection_b: str | None,
+                       table_name: str | None, threshold: float | None,
+                       min_area_m2: float | None, method: str | None,
+                       gsd: float | None = None, backend: str = "vision") -> dict:
+    """Validate and enqueue orthophoto change detection (worker does the rest)."""
+    if backend not in ("sam3", "vision"):
+        return {"error": "backend must be 'vision' (default) or 'sam3'"}
+    if not isinstance(concepts, list) or not 1 <= len(concepts) <= 6:
+        return {"error": "concepts must be a list of 1-6 ENGLISH noun phrases, "
+                         "e.g. ['building', 'swimming pool', 'storage yard']"}
+    clean_concepts = [str(c).strip() for c in concepts]
+    if any(not 1 <= len(c) <= 80 for c in clean_concepts):
+        return {"error": "each concept must be 1-80 characters after trimming"}
+    if not collection_a or not collection_b:
+        return {"error": "collection_a and collection_b are required — query catalog.datasets "
+                         "(source kind 'stac' or 'wms') to list orthophoto collections/layers"}
+    if collection_a == collection_b:
+        return {"error": "collection_a and collection_b must be different vintages"}
+    if not area or not isinstance(area, str):
+        return {"error": f"area is required — pass {_AREA_FORMS}"}
+    if not table_name:
+        return {"error": "table_name is required — results land in <ws>.<table_name> "
+                         "and <ws>.<table_name>_coverage"}
+    if not sqlguard.LAYER_NAME_RE.match(table_name):
+        return {"error": f"table_name {table_name!r} invalid — use ^[a-z][a-z0-9_]{{0,59}}$"}
+    if len(table_name) > 54:
+        # the '_coverage' companion must also fit Postgres's 63-char identifier limit
+        return {"error": "table_name too long — max 54 chars so <table_name>_coverage "
+                         "stays a valid identifier"}
+    try:
+        thr = 0.5 if threshold is None else float(threshold)
+    except (TypeError, ValueError):
+        return {"error": "threshold must be a number between 0.05 and 0.95"}
+    if not 0.05 <= thr <= 0.95:
+        return {"error": f"threshold {thr} out of bounds — use 0.05..0.95 (default 0.5)"}
+    min_area = None
+    if min_area_m2 is not None:
+        try:
+            min_area = float(min_area_m2)
+        except (TypeError, ValueError):
+            return {"error": "min_area_m2 must be a positive number"}
+        if min_area <= 0:
+            return {"error": "min_area_m2 must be a positive number"}
+    expected_method = "vision_compare" if backend == "vision" else "mask_compare"
+    method = method or expected_method
+    if method != expected_method:
+        return {"error": f"backend={backend!r} requires method={expected_method!r}; "
+                         "omit method to select it automatically"}
+    proc_gsd = None
+    if gsd is not None:
+        try:
+            proc_gsd = float(gsd)
+        except (TypeError, ValueError):
+            return {"error": "gsd must be a number (metres per pixel)"}
+        if not 0.05 <= proc_gsd <= 2.0:
+            return {"error": f"gsd {proc_gsd} out of bounds — use 0.05..2.0 m/px "
+                             "(only applies to WMS vintages; STAC items carry their own)"}
+
+    ws = sessions.ws_schema_for(workspace_id)
+    with db.app_pool().connection() as conn:
+        for cid in (collection_a, collection_b):
+            row = conn.execute(
+                """SELECT s.kind FROM catalog.datasets d
+                     JOIN catalog.sources s ON s.id = d.source_id
+                          AND s.kind IN ('stac', 'wms')
+                    WHERE d.external_id = %s""",
+                (cid,),
+            ).fetchone()
+            if row is None:
+                return {"error": f"unknown collection {cid!r} — query catalog.datasets "
+                                 "(source kind 'stac' for STAC collections, 'wms' for "
+                                 "orthophoto vintage layers)"}
+        for t in (table_name, f"{table_name}_coverage"):
+            exists = conn.execute("SELECT to_regclass(%s)", (f"{ws}.{t}",)).fetchone()
+            if exists and exists[0] is not None:
+                return {"error": f"{ws}.{t} already exists — drop it via layer(op='drop') "
+                                 "or pick another table_name"}
+        area_wkt, err = _resolve_area_wkt(conn, area)
+        if err:
+            return {"error": err}
+        row = conn.execute(
+            "SELECT ST_IsEmpty(g), ST_Dimension(g), ST_Area(g) / 1e6"
+            " FROM (SELECT ST_GeomFromText(%s, 3014) AS g) t", (area_wkt,)
+        ).fetchone()
+        if row[0]:
+            return {"error": f"area is empty — pass {_AREA_FORMS}"}
+        if row[1] < 2:
+            return {"error": f"area must be an areal geometry (polygon) — pass {_AREA_FORMS}"}
+        area_km2 = float(row[2])
+        if area_km2 > CHANGE_AREA_CAP_KM2:
+            return {"error": f"area is {area_km2:.2f} km² — cap is {CHANGE_AREA_CAP_KM2:g} km² "
+                             "per run; tile larger studies into multiple calls"}
+
+    target_schema = sessions.ensure_ws_schema(workspace_id)
+    payload = {"area_wkt_3014": area_wkt, "table_name": table_name,
+               "target_schema": target_schema, "concepts": clean_concepts,
+               "collection_a": collection_a, "collection_b": collection_b,
+               "threshold": thr, "min_area_m2": min_area, "method": method,
+               "gsd": proc_gsd, "backend": backend}
+    note = ("Vision compares paired image crops through the model endpoint; results are approximate "
+            "bounding boxes, not segmented footprints — poll with analyze(op='status', job_id=...)"
+            if backend == "vision" else
+            "SAM3 inference typically runs minutes (the first call also loads "
+            "the model) — poll with analyze(op='status', job_id=...)")
+    return job_ops.submit(
+        "change_detect", payload, workspace_id, note)
+
+
+_CHANGE_DETECT_SCHEMA = {
+    "type": "object",
+    "required": ["area", "concepts", "collection_a", "collection_b", "table_name"],
+    "additionalProperties": False,
+    "properties": {
+        "backend": {
+            "type": "string", "enum": ["vision", "sam3"], "default": "vision",
+            "description": "sam3: local segmentation. vision: paired image crops sent to "
+                           "the configured vision model via the configured endpoint, returning approximate "
+                           "bounding boxes. Requires worker vision endpoint configuration; no SAM3 needed.",
+        },
+        "area": {
+            "type": "string",
+            "description": "Analysis area: a layer ref ('ref.<t>' or '<ws schema>.<t>' — "
+                           "its bounding box is used), 'xmin,ymin,xmax,ymax' in EPSG:3014, "
+                           "or EPSG:3014 WKT polygon. Max 2 km² per run.",
+        },
+        "concepts": {
+            "type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 80},
+            "minItems": 1, "maxItems": 6,
+            "description": "1-6 free-text noun phrases, ENGLISH ONLY — the model's text "
+                           "grounding fails silently on Swedish (verified: 'byggnad' finds "
+                           "nothing where 'building' scores 0.8+). Translate first: "
+                           "byggnad→'building', småhus→'house', upplag→'storage yard', "
+                           "pool→'swimming pool', parkeringsplats→'parking lot'.",
+        },
+        "collection_a": {
+            "type": "string",
+            "description": "Earlier imagery vintage: a STAC orthophoto collection id "
+                           "(catalog source kind 'stac', e.g. 'orto-t2-2021') or a WMS "
+                           "orthophoto vintage layer (source kind 'wms', e.g. "
+                           "'Lantmateriet:Orto2010_wms').",
+        },
+        "collection_b": {
+            "type": "string",
+            "description": "Later imagery vintage; same forms as collection_a. STAC and "
+                           "WMS vintages can be mixed in one run.",
+        },
+        "table_name": {
+            "type": "string", "pattern": "^[a-z][a-z0-9_]{0,53}$",
+            "description": "Result layer name — writes <ws>.<table_name> and "
+                           "<ws>.<table_name>_coverage (max 54 chars).",
+        },
+        "threshold": {
+            "type": "number", "minimum": 0.05, "maximum": 0.95, "default": 0.5,
+            "description": "SAM3 segmentation confidence threshold; not used by Vision.",
+        },
+        "min_area_m2": {
+            "type": "number", "exclusiveMinimum": 0,
+            "description": "Drop candidates smaller than this; default 15·(gsd/0.16)² m². "
+                           "For Vision this is bounding-box area, not measured building area.",
+        },
+        "method": {
+            "type": "string", "enum": ["mask_compare", "vision_compare"],
+            "description": "Omit to select automatically: mask_compare for SAM3, "
+                           "vision_compare for Vision. Must match the backend.",
+        },
+        "gsd": {
+            "type": "number", "minimum": 0.05, "maximum": 2.0,
+            "description": "Processing resolution in m/px for WMS vintages (default 0.25); "
+                           "STAC items carry their own.",
+        },
+    },
+}
+
+_CHANGE_DETECT_GUIDE = """\
+Compare two orthophoto vintages with backend='vision' (default, paired image crops
+sent to the configured model endpoint) or backend='sam3' (concept segmentation).
+Write where concepts appeared / disappeared / changed to your workspace. Results are change
+CANDIDATES for review, not conclusions — inspect them against the imagery
+before reporting anything.
+
+The vision backend uses pairs of 800-pixel crops with 50% overlap, detail='high',
+four concurrent requests and a 16,384-token output allowance by default. Concurrency
+and output allowance are configurable. Images go to the configured worker endpoint.
+The provider controls the actual visual token count. No SAM3 service is required.
+Omit method (selected from backend); threshold applies only to SAM3.
+Vision output is APPROXIMATE BOUNDING BOXES, not segmentation or verified footprints:
+geometry_kind='bbox', backend='vision', tile_id, change_type, confidence_label,
+before_description, after_description and evidence are included. Numerical
+confidence_a/confidence_b/iou stay NULL; area_m2 measures the box, not the building.
+Overlapping tiles can return duplicates. Do not count boxes as unique buildings.
+
+List available vintages via the query tool:
+  SELECT d.external_id, s.kind FROM catalog.datasets d
+    JOIN catalog.sources s ON s.id = d.source_id AND s.kind IN ('stac','wms')
+   WHERE d.external_id ~* 'orto'
+The Sundsvall GeoServer's Lantmäteriet cascades (e.g.
+'Lantmateriet:HistoriskaOrtofoton1975_wms') are free — no Lantmäteriet account
+needed. WMS vintages have no capture-date metadata — the vintage year comes
+from the layer name, so cross-season false positives cannot be warned about.
+
+Output layers:
+  <ws>.<table_name>           candidate polygons: concept, change_class
+                              ('appeared'|'disappeared'|'changed'), confidence_a,
+                              confidence_b, iou, area_m2, vintage/datetime
+                              columns, geom (EPSG:3014)
+  <ws>.<table_name>_coverage  per-tile analysis status: 'analyzed'|'missing_a'|
+                              'missing_b'|'error', gsd_m, geom
+
+Reading absence correctly: no candidate rows over an 'analyzed' tile means no
+change found there; any OTHER coverage status means the tile was NOT analyzed —
+check coverage before treating absence as evidence.
+
+Runs minutes (the first call also loads the model); analyze(op='run') returns a
+job_id — poll with analyze(op='status'). Follow up: query the result table, map
+it over the orthophoto WMS ('wms:<dataset id>' as basemap — the map tool
+auto-attaches the before/after vintages and the viewer's compare inspector),
+refine concepts, re-run on subareas."""
+
+
+def _run_change_detect_params(workspace_id: str, params: dict) -> dict:
+    return _run_change_detect(
+        workspace_id,
+        area=params.get("area"),
+        concepts=params.get("concepts"),
+        collection_a=params.get("collection_a"),
+        collection_b=params.get("collection_b"),
+        table_name=params.get("table_name"),
+        threshold=params.get("threshold"),
+        min_area_m2=params.get("min_area_m2"),
+        method=params.get("method"),
+        gsd=params.get("gsd"),
+        backend=params.get("backend", "vision"),
+    )
+
+
+# ── the registry ─────────────────────────────────────────────────────────────
+# One entry per processor: constant tool surface, growth happens here.
+
+REGISTRY = {
+    "inspect": inspection_ops.PROCESSOR,
+    "imagery": imagery_ops.PROCESSOR,
+    "change_detect": {
+        "title": "Orthophoto change detection (SAM3 or Vision)",
+        "summary": "Where did concepts appear/disappear/change between two imagery "
+                   "vintages? Writes candidate + coverage layers.",
+        "guide": _CHANGE_DETECT_GUIDE,
+        "schema": _CHANGE_DETECT_SCHEMA,
+        "run": _run_change_detect_params,
+    },
+}
+
+
+# ── ops ──────────────────────────────────────────────────────────────────────
+
+def list_processors() -> dict:
+    return {"processors": [
+        {"id": pid, "title": spec["title"], "summary": spec["summary"]}
+        for pid, spec in REGISTRY.items()
+    ], "note": "analyze(op='describe', id=...) returns a processor's full guidance "
+               "and the JSON Schema of its params"}
+
+
+def describe(processor_id: str | None) -> dict:
+    spec = REGISTRY.get(processor_id or "")
+    if spec is None:
+        return {"error": f"unknown processor {processor_id!r} — "
+                         f"known: {', '.join(sorted(REGISTRY))}"}
+    return {"id": processor_id, "title": spec["title"], "summary": spec["summary"],
+            "guide": spec["guide"], "params_schema": spec["schema"]}
+
+
+def run(workspace_id: str, processor_id: str | None, params: dict | None) -> dict:
+    spec = REGISTRY.get(processor_id or "")
+    if spec is None:
+        return {"error": f"unknown processor {processor_id!r} — "
+                         f"known: {', '.join(sorted(REGISTRY))}; "
+                         "discover with analyze(op='list')"}
+    if not isinstance(params, dict):
+        return {"error": "params must be an object — analyze(op='describe', "
+                         f"id='{processor_id}') returns its schema"}
+    unknown = set(params) - set(spec["schema"]["properties"])
+    if unknown:
+        return {"error": f"unknown param(s) {sorted(unknown)} for {processor_id!r} — "
+                         f"schema allows {sorted(spec['schema']['properties'])}"}
+    missing = [k for k in spec["schema"].get("required", ()) if params.get(k) is None]
+    if missing:
+        return {"error": f"missing required param(s) {missing} — analyze(op='describe', "
+                         f"id='{processor_id}') explains each"}
+    return spec["run"](workspace_id, params)
+
+
+def status(job_id, timeout_s: float | None = None, workspace_id=None) -> dict:
+    out = job_ops.status(job_id, 25 if timeout_s is None else timeout_s,
+                         workspace_id=workspace_id)
+    if "error" in out and "status" not in out:
+        return out
+    job = out
+    if job["status"] == "done" and isinstance(job.get("result"), dict):
+        tbl = job["result"].get("table")
+        if tbl:
+            out["note"] = (f"result layers ready: {tbl} (+ coverage) — read with the "
+                           "query tool, style with layer, show with map")
+    return out
+
+
+def cancel(job_id, workspace_id=None) -> dict:
+    return job_ops.cancel(job_id, workspace_id=workspace_id)

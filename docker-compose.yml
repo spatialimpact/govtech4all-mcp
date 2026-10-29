@@ -1,0 +1,158 @@
+name: geodata-mcp-v2
+
+x-appenv: &appenv
+  DATABASE_URL_APP: postgresql://geodata_app:${APP_DB_PASSWORD}@postgres:5432/${POSTGRES_DB}
+  DATABASE_URL_RO: postgresql://agent_ro:${AGENT_RO_PASSWORD}@postgres:5432/${POSTGRES_DB}
+  DATABASE_URL_WS: postgresql://agent_ws:${AGENT_WS_PASSWORD}@postgres:5432/${POSTGRES_DB}
+  PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8080}
+  S3_ENDPOINT: http://minio:9000
+  S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT:-http://localhost:9000}
+  S3_BUCKET: exports
+  MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+  MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+  EMBED_URL: http://worker:8100/embed
+  EMBED_MODEL: ${EMBED_MODEL:-}
+  EMBED_DIM: "${EMBED_DIM:-256}"
+
+services:
+  postgres:
+    restart: unless-stopped
+    build: ./db
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?set in .env — copy .env.example}
+      POSTGRES_USER: ${POSTGRES_USER:?set in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+      # Consumed by db/init/02_roles.sh on first start only.
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?set in .env}
+      AGENT_RO_PASSWORD: ${AGENT_RO_PASSWORD:?set in .env}
+      AGENT_WS_PASSWORD: ${AGENT_WS_PASSWORD:?set in .env}
+    command: >
+      postgres -c shared_preload_libraries=pgaudit
+               -c max_connections=120
+               -c shared_buffers=512MB
+    ports:
+      # Host-only: the app services reach postgres over the compose network.
+      # Publishing on 0.0.0.0 would put the DB one firewall-rule away from the
+      # internet (docker's iptables bypasses ufw).
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  minio:
+    restart: unless-stopped
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set in .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set in .env}
+    ports:
+      # Host-only: Caddy proxies /exports/* to 127.0.0.1:9000 on the host, and
+      # the app services use the compose-internal minio:9000. The console
+      # (9001) is host-only too — reach it over the tailnet/SSH tunnel.
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  mcp:
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: services/mcp/Dockerfile
+    environment:
+      <<: *appenv
+      # Bearer keys for /mcp (comma-separated raw keys; hashed at startup).
+      GEODATA_API_KEYS: ${GEODATA_API_KEYS:?set in .env — auth is not optional}
+      # Shared invite code for the OAuth browser-login flow (empty disables OAuth).
+      GEODATA_INVITE_CODE: ${GEODATA_INVITE_CODE:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/healthz', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  worker:
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: services/worker/Dockerfile
+    environment:
+      <<: *appenv
+      # Basic-auth for authenticated sources (data_sources.xlsx): one var for
+      # every *.lantmateriet.se service, per-host entries for anything else.
+      LANTMATERIET_CREDENTIALS: ${LANTMATERIET_CREDENTIALS:-}
+      GEODATA_HTTP_CREDENTIALS: ${GEODATA_HTTP_CREDENTIALS:-}
+      # SAM3 segmenter runs natively on the host (see services/segmenter/README.md).
+      SAM3_URL: ${SAM3_URL:-http://host.docker.internal:8200}
+      VISION_BASE_URL: ${VISION_BASE_URL:-}
+      VISION_MODEL: ${VISION_MODEL:-}
+      VISION_MAX_OUTPUT_TOKENS: ${VISION_MAX_OUTPUT_TOKENS:-16384}
+      VISION_RESPONSE_FORMAT: ${VISION_RESPONSE_FORMAT:-json_schema}
+      VISION_EXTRA_BODY: ${VISION_EXTRA_BODY:-}
+      VISION_OCR_EXTRA_BODY: ${VISION_OCR_EXTRA_BODY:-}
+      VISION_API_KEY: ${VISION_API_KEY:-}
+      VISION_CONCURRENCY: ${VISION_CONCURRENCY:-4}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8100/healthz', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  viewer:
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: services/viewer/Dockerfile
+    environment:
+      <<: *appenv
+      # Signs the workspace-manager login cookie (any long random string).
+      VIEWER_SECRET: ${VIEWER_SECRET:?set in .env}
+      # For the authenticated-WMS proxy (/wmsref); same vars as the worker.
+      LANTMATERIET_CREDENTIALS: ${LANTMATERIET_CREDENTIALS:-}
+      GEODATA_HTTP_CREDENTIALS: ${GEODATA_HTTP_CREDENTIALS:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8001/healthz', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  caddy:
+    restart: unless-stopped
+    image: caddy:2-alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on:
+      - mcp
+      - viewer
+
+volumes:
+  pgdata:
+  minio-data:
+  hf-cache:
