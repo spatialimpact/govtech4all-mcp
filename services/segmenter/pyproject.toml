@@ -7,13 +7,13 @@ version = "0.1.0"
 description = "SAM3 concept segmentation HTTP service for geodata-mcp-v2 change detection"
 requires-python = ">=3.13"
 dependencies = [
-    "fastapi>=0.115",
-    "uvicorn>=0.30",
+    "fastapi>=0.162.0",
+    "uvicorn>=0.54.0",
     "pillow>=10",
-    "numpy>=2",
+    "numpy>=2.5.4",
     "huggingface-hub>=0.26",
-    "mlx>=0.30",
-    "torch>=2.9.1",
+    "mlx>=0.32.4",
+    "torch>=2.14.1",
     # Pinned to the mlx_sam3 HEAD commit verified against this service. Import
     # name is `sam3` — never install the HF/Meta sam3 package in the same venv.
     "mlx-sam3 @ git+https://github.com/Deekshith-Dade/mlx_sam3.git@9eacae749049e2b864fe63f90f3dd17c689bee03",
@@ -21,9 +21,9 @@ dependencies = [
 
 [project.optional-dependencies]
 hf = [
-    "transformers>=5,<6",
-    "torch>=2.9",
-    "accelerate>=1.1",
+    "transformers>=5.20.2,<6",
+    "torch>=2.14.1",
+    "accelerate>=1.15.0",
 ]
 
 [tool.uv]
