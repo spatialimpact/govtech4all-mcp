@@ -1,5 +1,5 @@
 # MCP server — agent-facing control plane (FastMCP streamable HTTP on :8000)
-FROM python:3.12-slim
+FROM python:3.15-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
